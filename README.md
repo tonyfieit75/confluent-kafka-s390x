@@ -50,14 +50,14 @@ oc apply -f kafka-kraft-ocp.yaml
 This will automatically:
 - Create the headless service  
 - Create the StatefulSet  
-- Deploy 1–3 Kafka pods  
+- Deploy 1–3 cp-Kafka pods  
 - Create all volumes  
 - Start Kafka cluster in KRaft mode  
 
 To scale:
 
 ```bash
-oc scale sts kafka --replicas=3
+oc scale sts cp-kafka --replicas=3
 ```
 
 To verify:
