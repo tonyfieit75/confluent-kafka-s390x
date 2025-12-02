@@ -1,0 +1,202 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: confluent-platform
+spec:
+  serviceName: kafka
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+
+  template:
+    metadata:
+      labels:
+        app: kafka
+
+    spec:
+      serviceAccountName: kafka
+      terminationGracePeriodSeconds: 300
+
+      # ✔ OpenShift-compatible global security context
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+
+        # 1️⃣ Fix data directory permissions
+        - name: fix-permissions
+          image: quay.io/tonyfieit75/kafka-kraft:s390x-4.1.0-fixed
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "📂 Preparing /var/lib/kafka/data directory..."
+              mkdir -p /var/lib/kafka/data
+              chmod -R g+rwX /var/lib/kafka/data || true
+              echo "UID: $(id -u)  GID: $(id -g)"
+              echo "✅ Data directory ready."
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: datadir
+              mountPath: /var/lib/kafka
+
+        # 2️⃣ Network connectivity pre-check
+        - name: network-check
+          image: registry.access.redhat.com/ubi8/ubi:8.9
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "🌐 Checking connectivity to brokers and controllers..."
+              peers="kafka-0.kafka.confluent-platform.svc.cluster.local kafka-1.kafka.confluent-platform.svc.cluster.local kafka-2.kafka.confluent-platform.svc.cluster.local"
+              for host in $peers; do
+                for port in 9092 9093; do
+                  echo "Testing $host:$port"
+                  for i in {1..10}; do
+                    if timeout 2 bash -c "echo > /dev/tcp/$host/$port" 2>/dev/null; then
+                      echo "✅ $host:$port reachable"
+                      break
+                    else
+                      echo "⏳ waiting for $host:$port..."
+                      sleep 2
+                    fi
+                  done
+                done
+              done
+              echo "✅ Network check done."
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: kafka
+          image: quay.io/tonyfieit75/kafka-kraft:s390x-4.1.0-fixed
+          imagePullPolicy: IfNotPresent
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+
+          ports:
+            - containerPort: 9092
+              name: broker
+            - containerPort: 9093
+              name: controller
+
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              ORDINAL="${POD_NAME##*-}"
+              export KAFKA_NODE_ID="${ORDINAL}"
+              echo "🧩 Starting Kafka node ${KAFKA_NODE_ID}..."
+              exec /usr/local/bin/run-kafka.sh
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+
+            - name: KAFKA_CONTROLLER_QUORUM_LISTENERS
+              value: "CONTROLLER://:9093"
+
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://$(POD_NAME).kafka.confluent-platform.svc.cluster.local:9092"
+
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "0@kafka-0.kafka.confluent-platform.svc.cluster.local:9093,1@kafka-1.kafka.confluent-platform.svc.cluster.local:9093,2@kafka-2.kafka.confluent-platform.svc.cluster.local:9093"
+
+            - name: KAFKA_CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-cluster-id
+                  key: clusterId
+
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+
+          volumeMounts:
+            - name: datadir
+              mountPath: /var/lib/kafka
+
+          # 🩵 Simplified and functional probes
+          startupProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ps -ef | grep -v grep | grep kafka.Kafka >/dev/null
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 30
+
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 >/dev/null 2>&1
+            initialDelaySeconds: 120
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - ps -ef | grep -v grep | grep kafka.Kafka >/dev/null
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+
+  volumeClaimTemplates:
+    - metadata:
+        name: datadir
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: managed-nfs-storage
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 5Gi
+
